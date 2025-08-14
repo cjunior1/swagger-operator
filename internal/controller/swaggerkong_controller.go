@@ -24,6 +24,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -134,7 +136,7 @@ func (r *SwaggerKongReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// ** INÍCIO DA NOVA LÓGICA DE CHECKSUM **
+	// valida se houve mudanças no conteúdo do Swagger
 	hasher := sha256.New()
 	hasher.Write(swaggerContent)
 	newChecksum := hex.EncodeToString(hasher.Sum(nil))
@@ -144,9 +146,8 @@ func (r *SwaggerKongReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 	logger.Info("Checksum do Swagger mudou. A reconciliar rotas.", "Checksum Antigo", swaggerKong.Status.LastAppliedSwaggerChecksum, "Checksum Novo", newChecksum)
-	// ** FIM DA NOVA LÓGICA DE CHECKSUM **
 
-	// 1. Converte o YAML em []byte para JSON em []byte.
+	// Converte o YAML em []byte para JSON em []byte.
 	// A função loads.Analyzed espera JSON.
 	swaggerJSONBytes, err := yaml.YAMLToJSON(swaggerContent)
 	if err != nil {
@@ -189,15 +190,14 @@ func (r *SwaggerKongReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	result, err := ctrl.CreateOrUpdate(ctx, r.Client, desiredIngress, func() error {
 		// Anotações para configurar o comportamento do Kong
 		annotations := map[string]string{
-			"konghq.com/preserve-host": "true",
+			"konghq.com/preserve-host":  "true",
+			"konghq.com/regex-priority": "1",
 		}
 
-		processedPath := "/"
-		pathType := networkingv1.PathTypePrefix
+		//processedPath := "/"
 
 		desiredIngress.Annotations = annotations
 
-		//pathType := networkingv1.PathTypePrefix
 		backend := networkingv1.IngressBackend{
 			Service: &networkingv1.IngressServiceBackend{
 				Name: swaggerKong.Spec.BackendService.Name,
@@ -207,19 +207,35 @@ func (r *SwaggerKongReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			},
 		}
 
+		var routes []networkingv1.HTTPIngressPath
+
+		for path := range specDoc.Spec().Paths.Paths {
+			processedPath := path
+			pathType := networkingv1.PathTypeExact
+
+			if strings.Contains(path, "{") {
+				re := regexp.MustCompile(`\{[^}]+\}`)
+				regexPath := re.ReplaceAllString(path, `([^/]+)`)
+				regexPath = strings.TrimPrefix(regexPath, "/")
+				processedPath = "/~/" + regexPath
+				pathType = networkingv1.PathTypeImplementationSpecific
+			}
+
+			routes = append(routes, networkingv1.HTTPIngressPath{
+				Path:     processedPath,
+				PathType: &pathType,
+				Backend:  backend,
+			},
+			)
+		}
+
 		// Definir as regras do Ingress
 		desiredIngress.Spec.Rules = []networkingv1.IngressRule{
 			{
-				Host: specDoc.Host(), // Usar o primeiro servidor definido no Swagger como host
+				Host: specDoc.Host(),
 				IngressRuleValue: networkingv1.IngressRuleValue{
 					HTTP: &networkingv1.HTTPIngressRuleValue{
-						Paths: []networkingv1.HTTPIngressPath{
-							{
-								Path:     processedPath,
-								PathType: &pathType,
-								Backend:  backend,
-							},
-						},
+						Paths: routes,
 					},
 				},
 			},
