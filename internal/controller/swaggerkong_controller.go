@@ -23,13 +23,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"os"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 
-	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/go-openapi/loads"
+	"github.com/go-openapi/spec"
+	"github.com/oasdiff/yaml"
+
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -144,125 +146,108 @@ func (r *SwaggerKongReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	logger.Info("Checksum do Swagger mudou. A reconciliar rotas.", "Checksum Antigo", swaggerKong.Status.LastAppliedSwaggerChecksum, "Checksum Novo", newChecksum)
 	// ** FIM DA NOVA LÓGICA DE CHECKSUM **
 
-	loader := openapi3.NewLoader()
-	doc, err := loader.LoadFromData([]byte(swaggerContent))
+	// 1. Converte o YAML em []byte para JSON em []byte.
+	// A função loads.Analyzed espera JSON.
+	swaggerJSONBytes, err := yaml.YAMLToJSON(swaggerContent)
 	if err != nil {
-		logger.Error(err, "Falha ao analisar o documento Swagger/OpenAPI")
+		fmt.Printf("Erro ao converter YAML para JSON: %v\n", err)
+		os.Exit(1)
+	}
+
+	specDoc, err := loads.Analyzed(swaggerJSONBytes, "2.0")
+	if err != nil {
+		logger.Error(err, "Falha ao carregar a especificação Swagger/OpenAPI")
+		return ctrl.Result{}, nil
+
+	}
+
+	if err := spec.ExpandSpec(specDoc.Spec(), nil); err != nil {
+		logger.Error(err, "Especificação Swagger/OpenAPI inválida")
 		return ctrl.Result{}, nil
 	}
 
-	routeCount := 0
-	for path, pathItem := range doc.Paths.Map() {
-		// Agrupar todos os métodos para um único caminho
-		var methods []string
-		for method := range pathItem.Operations() {
-			methods = append(methods, strings.ToUpper(method))
+	/*
+
+		loader := openapi3.NewLoader()
+		doc, err := loader.LoadFromData([]byte(swaggerContent))
+		if err != nil {
+			logger.Error(err, "Falha ao analisar o documento Swagger/OpenAPI")
+			return ctrl.Result{}, nil
+		}
+	*/
+	// criar ingress para todas as rotas do Swagger
+	ingressName := fmt.Sprintf("%s-ingress", deployment.Name)
+
+	// Objeto Ingress padrão do Kubernetes
+	desiredIngress := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ingressName,
+			Namespace: swaggerKong.Namespace,
+		},
+	}
+
+	result, err := ctrl.CreateOrUpdate(ctx, r.Client, desiredIngress, func() error {
+		// Anotações para configurar o comportamento do Kong
+		annotations := map[string]string{
+			"konghq.com/preserve-host": "true",
 		}
 
-		path = "/" + swaggerKong.Spec.BackendService.Name + path
+		processedPath := "/"
+		pathType := networkingv1.PathTypePrefix
 
-		sanitizedPath := strings.Trim(path, "/")
-		sanitizedPath = strings.ReplaceAll(sanitizedPath, "/", "-")
-		sanitizedPath = strings.ReplaceAll(sanitizedPath, "{", "")
-		sanitizedPath = strings.ReplaceAll(sanitizedPath, "}", "")
+		desiredIngress.Annotations = annotations
 
-		ingressName := fmt.Sprintf("%s-%s",
-			swaggerKong.Name,
-			strings.ToLower(sanitizedPath),
-		)
-
-		// Objeto Ingress padrão do Kubernetes
-		desiredIngress := &networkingv1.Ingress{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      ingressName,
-				Namespace: swaggerKong.Namespace,
+		//pathType := networkingv1.PathTypePrefix
+		backend := networkingv1.IngressBackend{
+			Service: &networkingv1.IngressServiceBackend{
+				Name: swaggerKong.Spec.BackendService.Name,
+				Port: networkingv1.ServiceBackendPort{
+					Number: int32(swaggerKong.Spec.BackendService.Port),
+				},
 			},
 		}
 
-		result, err := ctrl.CreateOrUpdate(ctx, r.Client, desiredIngress, func() error {
-			// Anotações para configurar o comportamento do Kong
-			annotations := map[string]string{
-				"konghq.com/strip-path": "true",
-				"konghq.com/methods":    strings.Join(methods, ","),
-			}
-
-			processedPath := path
-			pathType := networkingv1.PathTypeExact
-
-			if strings.Contains(path, "{") {
-				// Converte /path/{param} para uma regex válida como /~/path/([^/]+)
-				// que passa na validação do Kubernetes e é entendida pelo Kong.
-				re := regexp.MustCompile(`\{[^}]+\}`)
-				// Substitui {param} pelo grupo de captura regex
-				regexPath := re.ReplaceAllString(path, `([^/]+)`)
-				// Remove a barra inicial para evitar caminhos como /~/path
-				regexPath = strings.TrimPrefix(regexPath, "/")
-				// Adiciona o prefixo /~ que o Kong usa para identificar regex
-				processedPath = "/~/" + regexPath
-
-				pathType = networkingv1.PathTypeImplementationSpecific
-
-				// Adiciona a anotação de prioridade para rotas regex, uma boa prática do Kong
-				annotations["konghq.com/regex-priority"] = "1"
-			}
-
-			desiredIngress.Annotations = annotations
-
-			logger.Info("PATH= " + processedPath + " and PATH_TYPE= " + string(pathType))
-
-			//pathType := networkingv1.PathTypePrefix
-			backend := networkingv1.IngressBackend{
-				Service: &networkingv1.IngressServiceBackend{
-					Name: swaggerKong.Spec.BackendService.Name,
-					Port: networkingv1.ServiceBackendPort{
-						Number: int32(swaggerKong.Spec.BackendService.Port),
-					},
-				},
-			}
-
-			// Definir as regras do Ingress
-			desiredIngress.Spec.Rules = []networkingv1.IngressRule{
-				{
-					IngressRuleValue: networkingv1.IngressRuleValue{
-						HTTP: &networkingv1.HTTPIngressRuleValue{
-							Paths: []networkingv1.HTTPIngressPath{
-								{
-									Path:     processedPath,
-									PathType: &pathType,
-									Backend:  backend,
-								},
+		// Definir as regras do Ingress
+		desiredIngress.Spec.Rules = []networkingv1.IngressRule{
+			{
+				Host: specDoc.Host(), // Usar o primeiro servidor definido no Swagger como host
+				IngressRuleValue: networkingv1.IngressRuleValue{
+					HTTP: &networkingv1.HTTPIngressRuleValue{
+						Paths: []networkingv1.HTTPIngressPath{
+							{
+								Path:     processedPath,
+								PathType: &pathType,
+								Backend:  backend,
 							},
 						},
 					},
 				},
-			}
-			// Definir a classe de Ingress para garantir que o Kong o processe
-			ingressClassName := "kong"
-			desiredIngress.Spec.IngressClassName = &ingressClassName
-
-			// Definir o SwaggerKong como dono para garbage collection
-			return ctrl.SetControllerReference(&swaggerKong, desiredIngress, r.Scheme)
-		})
-
-		if err != nil {
-			logger.Error(err, "Falha ao criar ou atualizar Ingress", "Ingress", ingressName)
-			return ctrl.Result{}, err
+			},
 		}
+		// Definir a classe de Ingress para garantir que o Kong o processe
+		ingressClassName := "kong"
+		desiredIngress.Spec.IngressClassName = &ingressClassName
 
-		if result != controllerutil.OperationResultNone {
-			logger.Info("Ingress reconciliado", "Ingress", ingressName, "Resultado", result)
-		}
-		routeCount++
+		// Definir o SwaggerKong como dono para garbage collection
+		return ctrl.SetControllerReference(&swaggerKong, desiredIngress, r.Scheme)
+	})
+
+	if err != nil {
+		logger.Error(err, "Falha ao criar ou atualizar Ingress", "Ingress", ingressName)
+		return ctrl.Result{}, err
 	}
 
-	swaggerKong.Status.RouteCount = routeCount
+	if result != controllerutil.OperationResultNone {
+		logger.Info("Ingress reconciliado", "Ingress", ingressName, "Resultado", result)
+	}
+
 	swaggerKong.Status.LastAppliedSwaggerChecksum = newChecksum
 	if err := r.Status().Update(ctx, &swaggerKong); err != nil {
 		logger.Error(err, "Falha ao atualizar o status do SwaggerKong")
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Reconciliação do SwaggerKong concluída com sucesso.", "Nome", swaggerKong.Name, "Ingresses Criados/Atualizados", routeCount)
+	logger.Info("Reconciliação do SwaggerKong concluída com sucesso.", "Nome", swaggerKong.Name, "Ingresses Criados/Atualizados")
 	return ctrl.Result{}, nil
 }
 
