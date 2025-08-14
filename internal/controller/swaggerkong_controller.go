@@ -167,15 +167,10 @@ func (r *SwaggerKongReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 
-	/*
+	// TODO: Validar regras de governança internas, como:
 
-		loader := openapi3.NewLoader()
-		doc, err := loader.LoadFromData([]byte(swaggerContent))
-		if err != nil {
-			logger.Error(err, "Falha ao analisar o documento Swagger/OpenAPI")
-			return ctrl.Result{}, nil
-		}
-	*/
+	// fim da analise do Swagger/OpenAPI
+
 	// criar ingress para todas as rotas do Swagger
 	ingressName := fmt.Sprintf("%s-ingress", deployment.Name)
 
