@@ -1,0 +1,10 @@
+apiVersion: "kong.swagger.com/v1"
+Kind: "SwaggerKong"
+metadata:
+  name: "backend-service-api"
+spec:
+  swaggerConfigMapName: "backend-service-api-swagger"
+
+  backendService:
+    name: "backend-service"
+    port: 8080
