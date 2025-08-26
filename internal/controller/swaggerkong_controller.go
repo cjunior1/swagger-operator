@@ -37,12 +37,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	kongv1alpha1 "swagger-kong-operator/api/v1"
@@ -174,83 +172,71 @@ func (r *SwaggerKongReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// criar ingress para todas as rotas do Swagger
 	ingressName := fmt.Sprintf("%s-ingress", deployment.Name)
 
-	// Objeto Ingress padrão do Kubernetes
-	desiredIngress := &networkingv1.Ingress{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ingressName,
-			Namespace: swaggerKong.Namespace,
-		},
-	}
-
-	result, err := ctrl.CreateOrUpdate(ctx, r.Client, desiredIngress, func() error {
-		// Anotações para configurar o comportamento do Kong
-		annotations := map[string]string{
-			"konghq.com/preserve-host":  "true",
-			"konghq.com/regex-priority": "1",
+	var existingIngress networkingv1.Ingress
+	if err := r.Get(ctx, types.NamespacedName{Name: ingressName, Namespace: swaggerKong.Namespace}, &existingIngress); err != nil {
+		if !apierrors.IsNotFound(err) {
+			logger.Error(err, "Falha ao buscar Ingress existente", "Ingress", ingressName)
+			return ctrl.Result{}, fmt.Errorf("falha ao buscar Ingress existente: %w", err)
 		}
 
-		//processedPath := "/"
-
-		desiredIngress.Annotations = annotations
-
-		backend := networkingv1.IngressBackend{
-			Service: &networkingv1.IngressServiceBackend{
-				Name: swaggerKong.Spec.BackendService.Name,
-				Port: networkingv1.ServiceBackendPort{
-					Number: int32(swaggerKong.Spec.BackendService.Port),
-				},
-			},
-		}
-
-		var routes []networkingv1.HTTPIngressPath
-
-		for path := range specDoc.Spec().Paths.Paths {
-			processedPath := path
-			pathType := networkingv1.PathTypeExact
-
-			if strings.Contains(path, "{") {
-				re := regexp.MustCompile(`\{[^}]+\}`)
-				regexPath := re.ReplaceAllString(path, `([^/]+)`)
-				regexPath = strings.TrimPrefix(regexPath, "/")
-				processedPath = "/~/" + regexPath
-				pathType = networkingv1.PathTypeImplementationSpecific
-			}
-
-			routes = append(routes, networkingv1.HTTPIngressPath{
-				Path:     processedPath,
-				PathType: &pathType,
-				Backend:  backend,
-			},
-			)
-		}
-
-		// Definir as regras do Ingress
-		desiredIngress.Spec.Rules = []networkingv1.IngressRule{
-			{
-				Host: specDoc.Host(),
-				IngressRuleValue: networkingv1.IngressRuleValue{
-					HTTP: &networkingv1.HTTPIngressRuleValue{
-						Paths: routes,
-					},
-				},
-			},
-		}
-		// Definir a classe de Ingress para garantir que o Kong o processe
-		ingressClassName := "kong"
-		desiredIngress.Spec.IngressClassName = &ingressClassName
-
-		// Definir o SwaggerKong como dono para garbage collection
-		return ctrl.SetControllerReference(&swaggerKong, desiredIngress, r.Scheme)
-	})
-
-	if err != nil {
-		logger.Error(err, "Falha ao criar ou atualizar Ingress", "Ingress", ingressName)
+		logger.Error(err, "Ingress não encontrado.")
 		return ctrl.Result{}, err
 	}
 
-	if result != controllerutil.OperationResultNone {
-		logger.Info("Ingress reconciliado", "Ingress", ingressName, "Resultado", result)
+	backend := networkingv1.IngressBackend{
+		Service: &networkingv1.IngressServiceBackend{
+			Name: swaggerKong.Spec.BackendService.Name,
+			Port: networkingv1.ServiceBackendPort{
+				Number: int32(swaggerKong.Spec.BackendService.Port),
+			},
+		},
 	}
+
+	var desiredPaths []networkingv1.HTTPIngressPath
+	for path := range specDoc.Spec().Paths.Paths {
+		processedPath := path
+		pathType := networkingv1.PathTypeExact
+
+		if strings.Contains(path, "{") {
+			re := regexp.MustCompile(`\{[^}]+\}`)
+			regexPath := re.ReplaceAllString(path, `([^/]+)`)
+			regexPath = strings.TrimPrefix(regexPath, "/")
+			processedPath = "/~/" + regexPath
+			pathType = networkingv1.PathTypeImplementationSpecific
+		}
+
+		desiredPaths = append(desiredPaths, networkingv1.HTTPIngressPath{
+			Path:     processedPath,
+			PathType: &pathType,
+			Backend:  backend,
+		},
+		)
+	}
+
+	if existingIngress.Annotations == nil {
+		existingIngress.Annotations = make(map[string]string)
+	}
+	existingIngress.Annotations["konghq.com/regex-priority"] = "1"
+
+	existingIngress.Spec.Rules = []networkingv1.IngressRule{
+		{
+			IngressRuleValue: networkingv1.IngressRuleValue{
+				HTTP: &networkingv1.HTTPIngressRuleValue{
+					Paths: desiredPaths,
+				},
+			},
+		},
+	}
+
+	ingressClassName := "kong"
+	existingIngress.Spec.IngressClassName = &ingressClassName
+
+	if err := r.Update(ctx, &existingIngress); err != nil {
+		logger.Error(err, "Falha ao atualizar o Ingress existente", "Ingress", ingressName)
+		return ctrl.Result{}, err
+	}
+
+	logger.Info("Ingress existente atualizado com sucesso", "Ingress", ingressName)
 
 	swaggerKong.Status.LastAppliedSwaggerChecksum = newChecksum
 	if err := r.Status().Update(ctx, &swaggerKong); err != nil {

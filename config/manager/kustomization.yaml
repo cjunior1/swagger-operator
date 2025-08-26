@@ -5,4 +5,4 @@ kind: Kustomization
 images:
 - name: controller
   newName: cjunior1/swagger-kong-operator
-  newTag: v0.0.13
+  newTag: v0.0.14
